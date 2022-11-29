@@ -1,6 +1,8 @@
+import os
 import sys
 
-# import lpips
+import lpips
+import numpy as np
 from pytorch_msssim import ssim
 from tqdm import tqdm
 
@@ -9,6 +11,7 @@ from data import Dataset, TestDataset
 from log import TensorBoardX
 from network import GKMNet
 from utils import *
+import cv2
 
 # from time import time
 
@@ -29,7 +32,7 @@ def compute_loss(db256, db128, db64, batch, epoch):
     temp = (epoch % 1000) % 200
     if 0 <= temp < 100 and epoch >= 1000:
         le = 100
-        # print('ssim', end='')
+        print('ssim', end='')
         '''use ssim loss'''
         loss = 0
         loss += mse(db256, batch['label256'])
@@ -41,7 +44,7 @@ def compute_loss(db256, db128, db64, batch, epoch):
 
     else:
         le = 1
-        # print('mse', end='')
+        print('mse', end='')
         '''use mse loss'''
         loss = 0
         loss += mse(db256, batch['label256'])
@@ -49,7 +52,7 @@ def compute_loss(db256, db128, db64, batch, epoch):
         loss += mse(db128, batch['label128'])
         loss += mse(db64, batch['label64'])
     if epoch < 1000:
-        le = 100
+        le = 1000
 
     return {'mse': loss, 'psnr': psnr}
 
@@ -62,19 +65,20 @@ def backward(loss, optimizer):
 
 
 def set_learning_rate(optimizer, epoch):
-    if epoch < 2000:
+    if epoch < 3000:
         optimizer.param_groups[0]['lr'] = config.train['learning_rate']
     else:
         optimizer.param_groups[0]['lr'] = config.train['learning_rate'] * 0.1
 
 
 if __name__ == "__main__":
-    # loss_fn_alex = lpips.LPIPS(net='alex').cuda()
+    loss_fn_alex = lpips.LPIPS(net='alex').cuda()
+    os.makedirs('./GKMNet_result', exist_ok=True)
     tb = TensorBoardX(config_filename='train_config.py', sub_dir=config.train['sub_dir'])
     log_file = open('{}/{}'.format(tb.path, 'train.log'), 'w')
 
-    train_dataset = Dataset(config.train['train_DPDD_img_path'], config.train['train_DPDD_gt_path'])
-    test_dataset = TestDataset(config.train['test_DPDD_img_path'], config.train['test_DPDD_gt_path'])
+    train_dataset = Dataset(config.train['train_img_path'], config.train['train_gt_path'])
+    test_dataset = TestDataset(config.train['test_img_path'], config.train['test_gt_path'])
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=config.train['batch_size'], shuffle=True,
                                                    drop_last=True, num_workers=8, pin_memory=True,
                                                    worker_init_fn=worker_init_fn_seed)
@@ -87,6 +91,8 @@ if __name__ == "__main__":
 
     net = torch.nn.DataParallel(GKMNet()).cuda()
     total = sum([param.nelement() for param in net.parameters()])
+
+    cpsnr, cssim, clpips, bpsnr, bssim, blpips = 0, 0, 0, 0, 0, 0
 
     print("Number of parameter: %.2fM" % (total / 1e6))
 
@@ -145,7 +151,8 @@ if __name__ == "__main__":
                 first_val = False
                 psnr_list = []
                 ssim_list = []
-                # lpips_list = []
+                lpips_list = []
+                output_list = []
                 total_time = 0
                 for step, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader), file=sys.stdout,
                                         desc='validating'):
@@ -159,11 +166,10 @@ if __name__ == "__main__":
                     loss = compute_loss(db256, db128, db64, batch, epoch)
                     for k in loss:
                         loss[k] = float(loss[k].cpu().detach().numpy())
-                    # cv2.imwrite('our_result/' + str(step) + '.png',
-                    #             cv2.cvtColor(y256[0].cpu().numpy().transpose([1, 2, 0]) * 255., cv2.COLOR_BGR2RGB))
+                    output_list.append(db256[0].cpu().numpy().transpose([1, 2, 0]))
                     psnr_list.append(compute_psnr(db256, batch['label256'], 1).cpu().numpy())
                     ssim_list.append(ssim(db256, batch['label256'], data_range=1, size_average=False).cpu().numpy())
-                    # lpips_list.append(loss_fn_alex(db256, batch['label256']).cpu().numpy()[0][0][0][0])
+                    lpips_list.append(loss_fn_alex(db256*2-1, batch['label256']*2-1).cpu().numpy()[0][0][0][0])
                     if step:
                         total_time += (t - tt)
                     for k in loss:
@@ -173,12 +179,22 @@ if __name__ == "__main__":
                                        train_loss_log_list[0]}
                 val_loss_log_dict = {k: float(np.mean([dic[k] for dic in val_loss_log_list])) for k in
                                      val_loss_log_list[0]}
+                cpsnr = np.mean(psnr_list)
+                cssim = np.mean(ssim_list)
+                clpips = np.mean(lpips_list)
                 for k, v in val_loss_log_dict.items():
                     tb.add_scalar(k, v, (epoch + 1) * len(train_dataloader), 'val')
                 if best_val_psnr < val_loss_log_dict['psnr']:
+                    bpsnr = cpsnr
+                    bssim = cssim
+                    blpips = clpips
                     best_val_psnr = val_loss_log_dict['psnr']
                     save_model(net, tb.path, epoch)
                     save_optimizer(optimizer, net, tb.path, epoch)
+
+                    # save_images
+                    for l in range(len(val_dataloader)):
+                        cv2.imwrite('GKMNet_result/' + str(l).rjust(4, '0') + '.png', output_list[l]*255.)
                 elif epoch % 50 == 0:
                     save_model(net, tb.path, epoch)
                     save_optimizer(optimizer, net, tb.path, epoch)
@@ -209,3 +225,4 @@ if __name__ == "__main__":
                 log_file.write(log_msg + '\n')
                 log_file.flush()
                 t = time.time()
+                print('\ncurrent psnr/ssim/lpips: {:.3f}/{:.3f}/{:.3f}\nbest psnr/ssim/lpips: {:.3f}/{:.3f}/{:.3f}'.format(cpsnr,cssim,clpips,bpsnr,bssim,blpips) )
